@@ -1,7 +1,9 @@
 from importlib import import_module
 from types import ModuleType
 from PIL import Image
+import collections
 import io
+import os
 import time
 import numpy as np
 import torch
@@ -98,3 +100,44 @@ def array_to_image(image_array: np.ndarray, normalize: bool = True) -> Image.Ima
     image_array = image_array.astype(np.uint8)
     image = Image.fromarray(image_array)
     return image
+
+class LatencyTracker:
+    _enabled: bool = os.environ.get("LATENCY_DEBUG", "0") == "1"
+
+    def __init__(self, name: str, window: int=60, report_interval: int=30):
+        self.name = name
+        self.window = window
+        self.report_interval = report_interval
+        self.buffers: dict = {}
+        self.count: int = 0
+
+    @classmethod
+    def enabled(cls):
+        return cls._enabled
+    
+    def record(self, stage: str, value: float):
+        if not self._enabled:
+            return
+        if stage not in self.buffers:
+            self.buffers[stage] = collections.deque(maxlen=self.window)
+        self.buffers[stage].append(value)
+    
+    def tick(self):
+        if not self._enabled:
+            return
+        self.count += 1
+        if self.count % self.report_interval == 0:
+            self.print_report()
+
+    def print_report(self):
+        sep = "-" * 68
+        header = f"Latency Tracker [{self.name}] n = {self.count}"
+        lines = [f"\n{sep}", header.center(68), sep]
+        for stage, buf in self.buffers.items():
+            if not buf:
+                continue
+            vals = list(buf)
+            avg = sum(vals) /len(vals)
+            lines.append(f"  {stage:<32}  avg={avg:8.2f}  min={min(vals):8.2f}  max={max(vals):8.2f}")
+        lines.append(sep + "\n")
+        print("\n".join(lines), flush=True)

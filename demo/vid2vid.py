@@ -1,8 +1,9 @@
 import sys
 import os
+import time
 from omegaconf import OmegaConf
 from multiprocessing import Queue, Manager, Event, Process
-from util import read_images_from_queue, image_to_array, array_to_image, clear_queue
+from util import read_images_from_queue, image_to_array, array_to_image, clear_queue, LatencyTracker
 
 sys.path.append(
     os.path.join(
@@ -148,13 +149,15 @@ def generate_process(args, prompt_dict, prepare_event, restart_event, stop_event
     pipeline_manager.load_model(args.checkpoint_folder)
     num_steps = len(pipeline_manager.pipeline.denoising_step_list)
     base_chunk_size = pipeline_manager.base_chunk_size
-    chunk_size = base_chunk_size * args.num_frame_per_block
+    chunk_size = base_chunk_size * pipeline_manager.pipeline.num_frame_per_block
     first_batch_num_frames = 1 + chunk_size
     is_running = False
-    input_batch = 0
     prompt = prompt_dict["prompt"]
 
     prepare_event.set()
+
+    # define tracker
+    tracker = LatencyTracker("gpu_pipeline", report_interval=50)
 
     while not stop_event.is_set():
         # Prepare first batch
@@ -167,6 +170,13 @@ def generate_process(args, prompt_dict, prepare_event, restart_event, stop_event
 
             noise_scale = args.noise_scale
             init_noise_scale = args.noise_scale
+            noise_scale, current_step = compute_noise_scale_and_step(
+                input_video_original=images,
+                end_idx=first_batch_num_frames,
+                chunk_size=chunk_size,
+                noise_scale=float(noise_scale),
+                init_noise_scale=float(init_noise_scale),
+            )
 
             pipeline_manager.pipeline.vae.model.first_encode = True
             pipeline_manager.pipeline.vae.model.first_decode = True
@@ -181,7 +191,7 @@ def generate_process(args, prompt_dict, prepare_event, restart_event, stop_event
 
             # Prepare pipeline
             current_start = 0
-            current_end = pipeline_manager.pipeline.frame_seq_length * (1 + chunk_size//4)
+            current_end = pipeline_manager.pipeline.frame_seq_length * 2
             if pipeline_manager.pipeline.kv_cache1 is not None:
                 pipeline_manager.pipeline.reset_kv_cache()
                 pipeline_manager.pipeline.reset_crossattn_cache()
@@ -204,46 +214,60 @@ def generate_process(args, prompt_dict, prepare_event, restart_event, stop_event
             processed = 0
             is_running = True
 
-        if current_start//pipeline_manager.pipeline.frame_seq_length >= pipeline_manager.t_refresh:
+        #Debug
+        t_chunk = time.perf_counter()
+        tracker.record("input_q_depth [frames]", input_queue.qsize())
+        t0 = time.perf_counter()
+
+        if current_start//pipeline_manager.pipeline.frame_seq_length >= 50:
             current_start = pipeline_manager.pipeline.kv_cache_length - pipeline_manager.pipeline.frame_seq_length
             current_end = current_start + (chunk_size // base_chunk_size) * pipeline_manager.pipeline.frame_seq_length
 
-        if input_batch == 0:
-            images = read_images_from_queue(input_queue, chunk_size, device, stop_event, dynamic_batch=True)
-            num_frames = images.shape[2]
-            input_batch = num_frames // chunk_size
-        
-            noise_scale, current_step = compute_noise_scale_and_step(
-                input_video_original=torch.cat([last_image, images], dim=2),
-                end_idx=num_frames +1,
-                chunk_size=num_frames ,
-                noise_scale=float(noise_scale),
-                init_noise_scale=float(init_noise_scale),
-            )
+        images = read_images_from_queue(input_queue, chunk_size, device, stop_event, dynamic_batch=False)
+        tracker.record("queue_wait [ms]", (time.perf_counter() - t0) * 1000)
 
-            latents = pipeline_manager.pipeline.vae.stream_encode(images)
-            latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
-            noise = torch.randn_like(latents)
-            noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
-        
+        noise_scale, current_step = compute_noise_scale_and_step(
+            input_video_original=torch.cat([last_image, images], dim=2),
+            end_idx=first_batch_num_frames,
+            chunk_size=chunk_size,
+            noise_scale=float(noise_scale),
+            init_noise_scale=float(init_noise_scale),
+        )
+
+        t0 = time.perf_counter()
+        latents = pipeline_manager.pipeline.vae.stream_encode(images)
+        latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
+        noise = torch.randn_like(latents)
+        noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
+        tracker.record("vae_encode [ms]", (time.perf_counter() - t0) * 1000)
+
+        t0 = time.perf_counter()
         denoised_pred = pipeline_manager.pipeline.inference_stream(
-            noise=noisy_latents[:, -input_batch].unsqueeze(1),
+            noise=noisy_latents,
             current_start=current_start,
             current_end=current_end,
             current_step=current_step,
         )
-        input_batch-=1
+        tracker.record("denoising [ms]", (time.perf_counter() - t0) * 1000)
 
         processed += 1
         
         # VAE decoding - only start decoding after num_steps
         if processed >= num_steps:
+            t0 = time.perf_counter()
             video = pipeline_manager.pipeline.vae.stream_decode_to_pixel(denoised_pred[[-1]])
             video = (video * 0.5 + 0.5).clamp(0, 1)
             video = video[0].permute(0, 2, 3, 1).contiguous()
+            tracker.record("vae_decode [ms]", (time.perf_counter() - t0) * 1000)
             # Update timing
+            t0 = time.perf_counter()
             for image in video.cpu().float().numpy():
                 output_queue.put(image)
+            tracker.record("cp_xfer [ms]", (time.perf_counter() - t0) * 1000)
+            tracker.record("output_q_depth [frames]", output_queue.qsize())
+
+        tracker.record("total [ms]", (time.perf_counter() - t_chunk) * 1000)
+        tracker.tick()
 
         current_start = current_end
         current_end += (chunk_size // base_chunk_size) * pipeline_manager.pipeline.frame_seq_length
