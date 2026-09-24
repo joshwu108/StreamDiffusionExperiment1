@@ -19,7 +19,12 @@ class CausalStreamInferencePipeline(torch.nn.Module):
             model_name=self.generator_model_name)(model_type=model_type)
         self.text_encoder = get_text_encoder_wrapper(
             model_name=args.model_name)(model_type=model_type)
-        self.vae = get_vae_wrapper(model_name=args.model_name)(model_type=model_type)
+        # --vae {wan, taehv, taehv_parallel}: 'wan' keeps the model's default VAE wrapper,
+        # anything else selects a decoder-only swap registered in causvid.models.
+        vae_name = getattr(args, "vae", None) or "wan"
+        self.vae = get_vae_wrapper(
+            model_name=args.model_name if vae_name == "wan" else vae_name)(model_type=model_type)
+        print(f"VAE wrapper: {vae_name} -> {type(self.vae).__name__}")
 
         # Step 2: Initialize all causal hyperparmeters
         self._init_denoising_step_list(args, device)

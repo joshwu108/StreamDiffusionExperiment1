@@ -331,3 +331,119 @@ class CausalWanDiffusionWrapper(WanDiffusionWrapper):
         self.model.eval()
 
         self.uniform_timestep = False
+
+
+# --------------------------------------------------------------------------------------------
+# TAEHV decoder (plan.md Step 2). Encoder stays Wan; only the decoder is swapped.
+# --------------------------------------------------------------------------------------------
+
+TAEHV_DIR = os.environ.get("TAEHV_DIR", "/home/joshua/taehv")
+TAEHV_CKPT = os.environ.get("TAEHV_CKPT", "taew2_1.pth")
+
+
+def _import_taehv(taehv_dir: str):
+    """Import taehv.py either as an installed package or by file path from `taehv_dir`."""
+    try:
+        import taehv  # noqa: F401  (pip install -e /home/joshua/taehv)
+        return taehv
+    except ImportError:
+        pass
+    import importlib.util
+    import sys
+    path = os.path.join(taehv_dir, "taehv.py")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"taehv.py not found at {path}; set TAEHV_DIR or pip install taehv")
+    spec = importlib.util.spec_from_file_location("taehv", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["taehv"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TAEHVDecoderWrapper(WanVAEWrapper):
+    """
+    WanVAEWrapper with the decoder replaced by TAEHV (taew2_1, Wan 2.1 latent space).
+
+    Contract (identical to WanVAEWrapper.stream_decode_to_pixel):
+        input  latent  [B, T, 16, H/8, W/8]   in the DiT's (Wan-normalized) latent space
+        output pixels  [B, T_px, 3, H, W]     float32 in [-1, 1]
+    Frame accounting matches the Wan streaming decoder: the first call with T latents returns
+    4*T - 3 frames (startup frames trimmed once), every later call returns 4 frames per latent.
+
+    Latent convention: TAEHV consumes exactly what the diffusion model uses (no mean/std
+    scaling, see taehv README "How do I use TAEHV with Diffusers"), so the DiT output is fed
+    as-is. Verified against a real Wan latent in examples/check_taehv_latent_space.py.
+
+    decode_mode:
+        "stream"   StreamingTAEHV.decode per latent, MemBlock state carried across calls (correct).
+        "parallel" TAEHV.decode_video(parallel=True) per call: state reset every call and 3 raw
+                   frames trimmed per call. Reproduces the time-parallel misuse (hypothesis H3);
+                   returns 1 frame per chunk instead of 4.
+    The Wan VAE is still loaded (super().__init__) because rank 0 / the single-GPU path call
+    stream_encode on the same object.
+    """
+    decode_mode = "stream"
+
+    def __init__(self, model_type="T2V-1.3B", taehv_dir: Optional[str] = None,
+                 taehv_ckpt: Optional[str] = None, decode_mode: Optional[str] = None):
+        super().__init__(model_type=model_type)
+        self.decode_mode = decode_mode or self.decode_mode
+        assert self.decode_mode in ("stream", "parallel"), self.decode_mode
+        taehv_dir = taehv_dir or TAEHV_DIR
+        ckpt = taehv_ckpt or TAEHV_CKPT
+        if not os.path.isabs(ckpt):
+            ckpt = os.path.join(taehv_dir, ckpt)
+        self._taehv_mod = _import_taehv(taehv_dir)
+        self.taehv = self._taehv_mod.TAEHV(checkpoint_path=ckpt).eval().requires_grad_(False)
+        assert self.taehv.latent_channels == 16, "taew2_1 expected (16 latent channels)"
+        self.streaming = self._taehv_mod.StreamingTAEHV(self.taehv)
+        self.taehv_ckpt = ckpt
+        self.reset()
+
+    def reset(self):
+        """Start a new stream: drop TAEHV MemBlock memory and pending work; reset counters."""
+        self.streaming.reset()
+        self.num_decode_calls = 0
+        self.num_latents_in = 0
+        self.num_frames_out = 0
+
+    def _to_taehv(self, latent: torch.Tensor) -> torch.Tensor:
+        # [B, T, C, h, w] is already NTCHW, which is TAEHV's layout. Match TAEHV's device/dtype.
+        p = next(self.taehv.parameters())
+        return latent.to(device=p.device, dtype=p.dtype)
+
+    @staticmethod
+    def _from_taehv(frames: torch.Tensor) -> torch.Tensor:
+        # NTCHW in [0, 1]  ->  [B, T_px, 3, H, W] float32 in [-1, 1]
+        return frames.float().mul_(2.0).sub_(1.0).clamp_(-1.0, 1.0)
+
+    @torch.no_grad()
+    def stream_decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+        x = self._to_taehv(latent)
+        if self.decode_mode == "parallel":
+            out = self.taehv.decode_video(x, parallel=True, show_progress_bar=False)
+        else:
+            frames = []
+            f = self.streaming.decode(x)
+            while f is not None:
+                frames.append(f)
+                f = self.streaming.decode()
+            if frames:
+                out = torch.cat(frames, 1)
+            else:  # only possible while startup frames are being consumed (T < 1 latent)
+                out = x.new_zeros(x.shape[0], 0, 3, x.shape[3] * 8, x.shape[4] * 8)
+        self.num_decode_calls += 1
+        self.num_latents_in += x.shape[1]
+        self.num_frames_out += out.shape[1]
+        return self._from_taehv(out)
+
+    @torch.no_grad()
+    def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+        """Stateless full-clip decode (Mode A once over the whole clip); does not touch stream state."""
+        out = self.taehv.decode_video(self._to_taehv(latent), parallel=True, show_progress_bar=False)
+        return self._from_taehv(out)
+
+
+class TAEHVParallelDecoderWrapper(TAEHVDecoderWrapper):
+    """`--vae taehv_parallel`: the per-chunk time-parallel misuse (H3)."""
+    decode_mode = "parallel"

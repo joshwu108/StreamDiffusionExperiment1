@@ -44,7 +44,8 @@ time without breaking correctness, and V2's chunk size of one latent removes the
 | Path | What | Notes |
 |---|---|---|
 | `/home/joshua/StreamDiffusion.git` | Bare mirror of StreamDiffusion v1 (SD 1.5) | Reference only; no code changes here. |
-| `/home/joshua/StreamDiffusionV2/` | CausVid over Wan 2.1 1.3B, venv with torch 2.10+cu128 | Uses the **full Wan 2.1 causal VAE** today, not TAEHV (`causvid/models/wan/wan_wrapper.py:116-133`). |
+| `/home/joshua/StreamDiffusionV2/` | CausVid over Wan 2.1 1.3B | Uses the **full Wan 2.1 causal VAE** by default (`causvid/models/wan/wan_wrapper.py:116-133`); `--vae taehv` swaps the decoder since Step 2. |
+| Python envs | **Pipeline runs: conda env `stream`** (`/home/joshua/.conda/envs/stream/bin/python`, py3.10, torch 2.6+cu124, flash_attn 2.7.4, diffusers, PyAV). The repo `venv/` (py3.13, torch 2.10+cu128) is bare torch and only runs the Step 1 bench. | causvid is not installed in the conda env: launch with `PYTHONPATH=.` from the repo root. Use `examples/prompt.txt` as `--prompt_file_path` (the README passes the mp4, which `TextDataset` reads as text). |
 | `/home/joshua/taehv/` | TAEHV code + all checkpoints | `safetensors/taew2_1.safetensors` matches Wan 2.1's latent space. |
 | GPUs | 2 × A100 80GB PCIe | The README's 2-rank `torchrun` pipeline is runnable as-is. |
 
@@ -162,6 +163,54 @@ to produce the numbers the pipeline analysis needs, not to profile TAEHV.
   the incorrect time-parallel misuse for H3.
 - Encoder stays Wan on rank 0; the question is about the decoder.
 
+**Step 2 result (2026-09-24, A100 80GB PCIe ×2, bf16, 480×832, `examples/original.mp4` = 81 frames @16 fps = 20 chunks, `--step 2`):**
+
+Implemented:
+- `TAEHVDecoderWrapper(WanVAEWrapper)` in `causvid/models/wan/wan_wrapper.py`: same `stream_decode_to_pixel`
+  contract, Wan encoder kept for rank 0, `StreamingTAEHV` state carried across chunks, `reset()`, call/frame
+  counters. `TAEHVParallelDecoderWrapper` = Mode A per chunk (H3). Registered as `taehv` / `taehv_parallel`
+  in `causvid/models/__init__.py`; `CausalStreamInferencePipeline` reads `args.vae` (default `wan`, unchanged
+  behaviour). `--vae {wan,taehv,taehv_parallel}` added to `streamv2v/inference.py` and `inference_pipe.py`.
+  TAEHV is loaded from `$TAEHV_DIR` (default `/home/joshua/taehv`), checkpoint `$TAEHV_CKPT` (default `taew2_1.pth`).
+- `examples/check_taehv_latent_space.py`: latent-convention + wrapper-contract check on a real Wan latent
+  (9 latents = 33 frames of the clip). Output `outputs/check_taehv_latent_space.csv`.
+
+Latent convention (PSNR vs the Wan decoder's own full-clip decode of the same latent):
+
+| decoder input | frames | PSNR vs Wan decode | PSNR vs source |
+|---|---|---|---|
+| Wan `stream_decode` (V2 today) | 33 | exact | 33.6 dB |
+| TAEHV, DiT latent as-is (normalized, **wrapper default**) | 33 | **29.1 dB** | 28.8 dB |
+| TAEHV, un-normalized `z*std+mean` | 33 | 17.0 dB | 16.9 dB |
+| TAEHV streaming wrapper, V2 call pattern | 33 | 29.1 dB (== full-clip, max diff 0) | 28.8 dB |
+| `taehv_parallel`, V2 call pattern | **12** | 18.2 dB on the 12 surviving frames, 15.6–16.5 dB per chunk vs correct TAEHV | 18.2 dB |
+
+- TAEHV consumes the DiT's normalized latent directly, as its README states; un-normalizing costs 12 dB.
+- The streaming wrapper reproduces TAEHV's full-clip decode bit-exactly and returns the same frame count
+  as Wan's streaming path under V2's call pattern (2 latents on the first call, then 1 per chunk).
+
+Pipeline smoke runs (whole-loop "Average FPS" as logged by the scripts, no instrumentation yet; the two
+single-GPU runs shared the host concurrently, so treat single-GPU numbers as indicative only):
+
+| decoder | 1 GPU frames / FPS | 2 ranks frames / FPS | 2-rank final-rank loop, ms per chunk |
+|---|---|---|---|
+| `wan` | 81 / 8.8 | 81 / 14.9 | ~279 |
+| `taehv` | 81 / **14.3** | 81 / **24.6** | ~191 |
+| `taehv_parallel` (H3) | 24 / (14.4 as logged, but 1 frame per chunk, i.e. ~3.6 real) | 24 / 6.1 | ~191 |
+
+- Verification for Step 2 passes: `--vae taehv` gives the same 81 frames as `--vae wan` on 1 and 2 ranks;
+  output frames look like the Wan output (same content, slightly sharper/more saturated).
+- H3 demonstration: `taehv_parallel` returns 24 of 81 frames (5 from the first two-latent call, then 1 per
+  chunk) with visible blocky / blown-out artifacts, at the same per-call cost as the correct streaming decode.
+  `inference.py` reports FPS as `chunk_size / t`, so its 14.4 for this variant is fictitious; `inference_pipe.py`
+  uses the real frame count (6.1).
+- Preliminary observation for Step 3 (not yet attributed): swapping Wan → TAEHV removes ~156 ms of decode per
+  chunk in isolation (165 → 9 ms) but the 2-rank final-rank loop only shortens by ~88 ms (279 → 191 ms), and
+  FPS does improve 1 → 2 ranks with both decoders on this short clip. Something other than decode now bounds
+  the final rank's loop (receive-wait on rank 0's encode + DiT is the obvious candidate). Step 3's per-stage
+  CUDA-event timings are needed before drawing conclusions.
+- Artifacts: `outputs/check_taehv_latent_space.csv`, `outputs/step2/{1gpu,2gpu}_{wan,taehv,taehv_parallel}/output_000.mp4`.
+
 ### Step 3 — Instrument the pipeline (diagram page 2, stages 9–13)
 - In the final-rank loop, add CUDA-event timings for receive-wait, DiT, decode, and host copy; rank 0
   and middle loops already have DiT + comm timings. Dump per-iteration JSON per rank.
@@ -194,7 +243,8 @@ Report each fix as "final-rank stage ms before/after, pipeline FPS before/after,
 | Action | Path |
 |---|---|
 | New | `StreamDiffusionV2/examples/bench_taehv_decoder.py` |
-| Edit | `StreamDiffusionV2/causvid/models/wan/wan_wrapper.py` (add `TAEHVDecoderWrapper`) |
+| New | `StreamDiffusionV2/examples/check_taehv_latent_space.py` (Step 2 latent-convention / contract check) |
+| Edit | `StreamDiffusionV2/causvid/models/wan/wan_wrapper.py` (add `TAEHVDecoderWrapper`), `causvid/models/__init__.py` (registry), `causvid/models/wan/causal_stream_inference.py` (reads `args.vae`) |
 | Edit | `StreamDiffusionV2/streamv2v/inference.py`, `streamv2v/inference_pipe.py` (`--vae` flag, event timings) |
 | Reuse | `/home/joshua/taehv/taehv.py` (`TAEHV`, `StreamingTAEHV`); `WanVAEWrapper.stream_decode_to_pixel` as baseline |
 | Untouched | `/home/joshua/StreamDiffusion.git` (v1) |
@@ -203,7 +253,7 @@ Report each fix as "final-rank stage ms before/after, pipeline FPS before/after,
 
 - Step 1 ✅ done: streaming == full-clip Mode A (exact); chunked Mode A differs; T=1 streaming decode = 8.7 ms
   (tripwire value), Wan = 165 ms.
-- Step 2: `--vae taehv` produces a video with the same frame count as `--vae wan`; PSNR vs Wan decode reported.
+- Step 2 ✅ done: `--vae taehv` produces 81 frames like `--vae wan` on 1 and 2 ranks; TAEHV decode of a real Wan latent = 29.1 dB vs Wan decode (normalized latent as-is); `taehv_parallel` gives 24/81 frames.
 - Step 3: per-rank timing JSON exists for every configuration; a summary table reproduces the README-style
   FPS for `--vae wan` as a sanity anchor; the 1-rank vs 2-rank FPS ratio is reported per decoder.
 - Final write-up answers the question with numbers: decode share of the final-rank stage, whether FPS

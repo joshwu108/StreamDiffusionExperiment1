@@ -1,4 +1,7 @@
-from .wan.wan_wrapper import WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper, CausalWanDiffusionWrapper
+from .wan.wan_wrapper import (
+    WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper, CausalWanDiffusionWrapper,
+    TAEHVDecoderWrapper, TAEHVParallelDecoderWrapper
+)
 from causvid.bidirectional_trajectory_pipeline import BidirectionalInferenceWrapper
 from .sdxl.sdxl_wrapper import SDXLWrapper, SDXLTextEncoder, SDXLVAE
 from transformers.models.t5.modeling_t5 import T5Block
@@ -29,7 +32,10 @@ def get_text_encoder_wrapper(model_name):
 VAE_NAME_TO_CLASS = {
     "sdxl": SDXLVAE,
     "wan": WanVAEWrapper,
-    "causal_wan": WanVAEWrapper   # TODO: Change the VAE to the causal version
+    "causal_wan": WanVAEWrapper,   # TODO: Change the VAE to the causal version
+    # --vae {taehv, taehv_parallel}: Wan encoder + TAEHV decoder (plan.md Step 2)
+    "taehv": TAEHVDecoderWrapper,
+    "taehv_parallel": TAEHVParallelDecoderWrapper,
 }
 
 

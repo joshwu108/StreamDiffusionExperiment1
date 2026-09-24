@@ -606,6 +606,9 @@ def main():
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--schedule_block", action="store_true", default=False)
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
+    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel"],
+                        help="Decoder: wan = Wan 2.1 VAE stream_decode (default); taehv = StreamingTAEHV, state kept "
+                             "across chunks; taehv_parallel = TAEHV.decode_video(parallel=True) per chunk (H3 misuse)")
     
     args = parser.parse_args()
     

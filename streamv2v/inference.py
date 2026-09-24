@@ -325,6 +325,9 @@ def main():
     parser.add_argument("--fps", type=int, default=16, help="Output video fps")
     parser.add_argument("--step", type=int, default=2, help="Step")
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
+    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel"],
+                        help="Decoder: wan = Wan 2.1 VAE stream_decode (default); taehv = StreamingTAEHV, state kept "
+                             "across chunks; taehv_parallel = TAEHV.decode_video(parallel=True) per chunk (H3 misuse)")
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--target_fps", type=int, required=False, default=None, help="Video length (number of frames)")
