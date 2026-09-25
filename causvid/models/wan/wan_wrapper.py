@@ -447,3 +447,65 @@ class TAEHVDecoderWrapper(WanVAEWrapper):
 class TAEHVParallelDecoderWrapper(TAEHVDecoderWrapper):
     """`--vae taehv_parallel`: the per-chunk time-parallel misuse (H3)."""
     decode_mode = "parallel"
+
+
+class TAEHVFullWrapper(TAEHVDecoderWrapper):
+    """
+    `--vae taehv_full` (plan.md Step 5): TAEHV encoder on rank 0 as well as the TAEHV decoder.
+
+    stream_encode contract (identical to WanVAEWrapper.stream_encode as V2 calls it, is_scale=False):
+        input  video  [B, 3, T, H, W] in [-1, 1]; first call T = 5, later calls T = 4
+        output latent [B, 16, T_l, H/8, W/8]; first call T_l = 2, later T_l = 1
+
+    Latent space: Wan's stream_encode returns the raw posterior mean mu (no mean/std normalization)
+    and V2 feeds that to the DiT, whereas TAEHV's encoder produces latents in the normalized space
+    the DiT *outputs* (Step 2). encode_space="raw" (default) maps TAEHV's latent back with
+    z * std + mean so the DiT sees the same input statistics as today; "norm" feeds it as-is.
+    Override with TAEHV_ENC_SPACE=raw|norm.
+
+    Temporal alignment (verified in examples/check_taehv_encoder.py): TAEHV's TPool groups frames
+    [4m, 4m+3] into latent m, and that latent matches Wan's latent m (which Wan builds from frames
+    [4m-3, 4m]) to ~5 % relative error; feeding it Wan's own grouping instead produces a 3-frame
+    temporal offset (12 dB worse). So the streaming encoder is simply fed the frames as they come
+    and emits a latent whenever four have accumulated: V2's first call (frames 0..4) yields ONE
+    latent (frames 0..3) and holds frame 4; every later 4-frame chunk [4c+1, 4c+4] completes the
+    group [4c, 4c+3] and yields latent c. The stream is therefore one latent (4 frames) behind
+    Wan's, the first call returns 1 latent instead of 2, and the last partial group is dropped at
+    the end of the clip. The inference scripts size the first KV-cache block from the returned
+    latent count, so no padding or slicing change is needed.
+    """
+    encode_space = "raw"
+
+    def __init__(self, model_type="T2V-1.3B", encode_space: Optional[str] = None, **kw):
+        super().__init__(model_type=model_type, **kw)
+        self.encode_space = encode_space or os.environ.get("TAEHV_ENC_SPACE", self.encode_space)
+        assert self.encode_space in ("raw", "norm"), self.encode_space
+        self.enc_streaming = self._taehv_mod.StreamingTAEHV(self.taehv)
+        self.num_encode_calls = 0
+        self.num_frames_in = 0
+
+    def reset(self):
+        super().reset()
+        if hasattr(self, "enc_streaming"):
+            self.enc_streaming.reset()
+        self.num_encode_calls = 0
+        self.num_frames_in = 0
+
+    @torch.no_grad()
+    def stream_encode(self, video: torch.Tensor, is_scale: bool = False) -> torch.Tensor:
+        p = next(self.taehv.parameters())
+        x = video.permute(0, 2, 1, 3, 4).to(device=p.device, dtype=p.dtype)      # [B, T, 3, H, W]
+        x = (x * 0.5 + 0.5).clamp_(0.0, 1.0)                                    # TAEHV wants [0, 1]
+        self.num_frames_in += x.shape[1]
+        lats = []
+        z = self.enc_streaming.encode(x)          # frames are queued; a latent pops out per 4 accumulated
+        while z is not None:
+            lats.append(z)
+            z = self.enc_streaming.encode()
+        self.num_encode_calls += 1
+        assert lats, (f"TAEHV encoder emitted no latent: {x.shape[1]} frames in this call, "
+                      f"{self.num_frames_in} so far (needs 4 per latent)")
+        z = torch.cat(lats, 1)                                                  # [B, T_l, 16, h, w]
+        if not is_scale and self.encode_space == "raw":
+            z = z * self.std.to(z).view(1, 1, -1, 1, 1) + self.mean.to(z).view(1, 1, -1, 1, 1)
+        return z.permute(0, 2, 1, 3, 4).contiguous()                            # [B, 16, T_l, h, w]

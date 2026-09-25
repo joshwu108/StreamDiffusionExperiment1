@@ -249,7 +249,7 @@ class InferencePipelineManager:
     def run_rank_0_loop(self, input_video_original: torch.Tensor, prompts: list, 
                        num_chunks: int, num_steps: int, chunk_size: int,
                        block_num: torch.Tensor, noise_scale: float, 
-                       schedule_block: bool, total_blocks: int):
+                       schedule_block: bool, total_blocks: int, first_chunk_latents: int = None):
         """
         Run the main loop for rank 0 (encoder + async send).
         
@@ -261,7 +261,9 @@ class InferencePipelineManager:
         start_idx = 0
         end_idx = 1 + chunk_size
         current_start = 0
-        current_end = self.pipeline.frame_seq_length * (1+chunk_size//self.base_chunk_size)
+        if first_chunk_latents is None:
+            first_chunk_latents = 1 + chunk_size // self.base_chunk_size   # Wan: 5 frames -> 2 latents
+        current_end = self.pipeline.frame_seq_length * first_chunk_latents
         init_noise_scale = noise_scale
         
         outstanding = []
@@ -763,7 +765,7 @@ def main():
     parser.add_argument("--step", type=int, default=2)
     parser.add_argument("--schedule_block", action="store_true", default=False)
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
-    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel"],
+    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel", "taehv_full"],
                         help="Decoder: wan = Wan 2.1 VAE stream_decode (default); taehv = StreamingTAEHV, state kept "
                              "across chunks; taehv_parallel = TAEHV.decode_video(parallel=True) per chunk (H3 misuse)")
     parser.add_argument("--timing_dir", type=str, default=None,
@@ -859,7 +861,6 @@ def main():
     start_idx = 0
     end_idx = 5
     current_start = 0
-    current_end = pipeline_manager.pipeline.frame_seq_length * 2
     
     inp = input_video_original[:, :, start_idx:end_idx]
     
@@ -883,6 +884,9 @@ def main():
         noisy_latents = torch.zeros(tuple(latents_shape.tolist()), dtype=torch.bfloat16, device=device)
         # Receive the broadcasted noisy_latents
         pipeline_manager.communicator.broadcast_tensor(noisy_latents, src=0)
+    # first KV block = however many latents the encoder made of the first 5 frames (Wan 2, TAEHV 1)
+    first_chunk_latents = int(latents_shape[1].item())
+    current_end = pipeline_manager.pipeline.frame_seq_length * first_chunk_latents
     
     denoised_pred = pipeline_manager.prepare_pipeline(
         text_prompts=prompts,
@@ -916,7 +920,8 @@ def main():
         if rank == 0:
             pipeline_manager.run_rank_0_loop(
                 input_video_original, prompts, num_chunks, num_steps, chunk_size,
-                block_num, args.noise_scale, args.schedule_block, total_blocks
+                block_num, args.noise_scale, args.schedule_block, total_blocks,
+                first_chunk_latents=first_chunk_latents
             )
         elif rank == world_size - 1:
             pipeline_manager.run_final_rank_loop(

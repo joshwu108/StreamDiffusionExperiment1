@@ -35,7 +35,7 @@ def load_rows(path):
 
 def parse_cfg(name):
     """'2gpu_taehv_od_oe_sched_r1' -> (ranks, vae, sched, rep, variant)."""
-    m = re.match(r"(\d)gpu_(wan|taehv_parallel|taehv)(_od)?(_oe)?(_sched)?_(r\d+)$", name)
+    m = re.match(r"(\d)gpu_(wan|taehv_parallel|taehv_full|taehv)(_od)?(_oe)?(_sched)?_(r\d+)$", name)
     if not m:
         return None
     variant = "".join(x.strip("_") + "+" for x in (m.group(3) or "", m.group(4) or "")).rstrip("+") or "base"
@@ -184,7 +184,7 @@ def main():
     variants = sorted({s["variant"] for s in summary}, key=lambda v: (v != "base", v))
     print("| decoder | variant | 1 GPU FPS | 2 ranks FPS (period ms) | ratio | 2 ranks + schedule FPS (period ms) | ratio |")
     print("|---|---|---|---|---|---|---|")
-    for vae in ("wan", "taehv", "taehv_parallel"):
+    for vae in ("wan", "taehv", "taehv_full", "taehv_parallel"):
         f1 = mean_of((vae, 1, 0, "base"), "fps")
         for variant in variants:
             f2, p2 = mean_of((vae, 2, 0, variant), "fps"), mean_of((vae, 2, 0, variant), "period_ms")

@@ -194,7 +194,6 @@ class SingleGPUInferencePipeline:
         start_idx = 0
         end_idx = 1 + chunk_size
         current_start = 0
-        current_end = self.pipeline.frame_seq_length * (1+chunk_size//4)
         
         torch.cuda.synchronize()
         start_time = time.time()
@@ -211,7 +210,8 @@ class SingleGPUInferencePipeline:
             noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
         else:
             noisy_latents = torch.randn(1,1+self.pipeline.num_frame_per_block,16,self.pipeline.height,self.pipeline.width, device=self.device, dtype=torch.bfloat16)
-        
+        # first KV block = however many latents the encoder made of the first 5 frames (Wan 2, TAEHV 1)
+        current_end = self.pipeline.frame_seq_length * noisy_latents.shape[1]
             
         # Prepare pipeline
         denoised_pred = self.prepare_pipeline(
@@ -345,7 +345,7 @@ def main():
     parser.add_argument("--fps", type=int, default=16, help="Output video fps")
     parser.add_argument("--step", type=int, default=2, help="Step")
     parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model type (e.g., T2V-1.3B)")
-    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel"],
+    parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel", "taehv_full"],
                         help="Decoder: wan = Wan 2.1 VAE stream_decode (default); taehv = StreamingTAEHV, state kept "
                              "across chunks; taehv_parallel = TAEHV.decode_video(parallel=True) per chunk (H3 misuse)")
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")

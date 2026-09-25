@@ -1,6 +1,6 @@
 from .wan.wan_wrapper import (
     WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper, CausalWanDiffusionWrapper,
-    TAEHVDecoderWrapper, TAEHVParallelDecoderWrapper
+    TAEHVDecoderWrapper, TAEHVParallelDecoderWrapper, TAEHVFullWrapper
 )
 from causvid.bidirectional_trajectory_pipeline import BidirectionalInferenceWrapper
 from .sdxl.sdxl_wrapper import SDXLWrapper, SDXLTextEncoder, SDXLVAE
@@ -36,6 +36,8 @@ VAE_NAME_TO_CLASS = {
     # --vae {taehv, taehv_parallel}: Wan encoder + TAEHV decoder (plan.md Step 2)
     "taehv": TAEHVDecoderWrapper,
     "taehv_parallel": TAEHVParallelDecoderWrapper,
+    # --vae taehv_full: TAEHV encoder + TAEHV decoder (plan.md Step 5)
+    "taehv_full": TAEHVFullWrapper,
 }
 
 

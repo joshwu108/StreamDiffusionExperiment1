@@ -340,6 +340,59 @@ Implemented in `streamv2v/inference_pipe.py`, both opt-in:
   ones this plan did not scope: replace the encoder as well (TAEHV encoder, 1.47 M params, untested for quality
   through the DiT), give encode or decode its own rank (fix (b), needs a 3rd GPU), or shrink the DiT.
 
+### Step 5 — Swap the encoder too (`--vae taehv_full`)
+
+Step 4 left the Wan encoder (101 ms, whole, on rank 0) as the floor of the 2-rank period. This step replaces it
+with TAEHV's encoder (1.47 M params) so both VAE halves are cheap, and measures the pipeline again.
+
+Implemented: `TAEHVFullWrapper` in `causvid/models/wan/wan_wrapper.py` (registered as `taehv_full`), which feeds
+V2's frame chunks to `StreamingTAEHV.encode` and returns the same `[B, 16, T_l, h, w]` contract as
+`WanVAEWrapper.stream_encode`. Two facts found on the way, both verified in `examples/check_taehv_encoder.py`:
+- **Latent space.** V2 calls `stream_encode` without scaling, so the DiT is fed Wan's *raw* posterior mean, while
+  the decoder path expects normalized latents. TAEHV's encoder emits normalized latents, so the wrapper maps them
+  back with `z*std + mean` by default (`TAEHV_ENC_SPACE=norm` to feed them as-is) to keep the DiT input unchanged.
+- **Temporal grouping.** TAEHV builds latent m from frames [4m, 4m+3] and that latent matches Wan's latent m
+  (built from [4m−3, 4m]) to 5 % relative error. Feeding TAEHV Wan's own chunk grouping [4c+1, 4c+4] instead gives
+  a 3-frame temporal offset and a 12 dB worse round trip (first attempt, discarded). The wrapper therefore lets
+  the streaming encoder accumulate frames natively: the first 5-frame call yields 1 latent (Wan yields 2), every
+  4-frame chunk then yields exactly 1, the stream runs one latent behind Wan's and drops the last partial group
+  (81 frames → 77 output frames). Both inference scripts now size the first KV block from the returned latent
+  count instead of the hard-coded 2 (`first_chunk_latents`).
+
+Encoder check (`outputs/check_taehv_encoder.csv`, 81-frame clip, V2 call pattern, bf16):
+
+| | latency per 4-frame chunk | latent vs Wan mu (rel. L2, cosine) | round trip PSNR vs source |
+|---|---|---|---|
+| Wan encoder → Wan decoder | **101.1 ms** | – | 33.4 dB |
+| TAEHV encoder → Wan decoder | **7.1 ms** | 0.05, 1.00 (every latent) | 31.6 dB |
+| Wan encoder → TAEHV decoder | | | 28.8 dB |
+| TAEHV encoder → TAEHV decoder | | | 28.2 dB (= TAEHV's own full-clip round trip) |
+
+Pipeline smoke (20-chunk clip, 2 ranks, default split): 77 frames, period ≈ 105 ms with rank 0 = encode 7.5 +
+DiT 87 + recv 11 and rank 1 = DiT 87 + decode 9 + copy 5; the 15/15 block split is already balanced.
+
+**Step 5 result (2026-09-25, `examples/original_x3.mp4`, one repeat; commands in `outputs/step5/commands.txt`):**
+
+| config | period ms | rank 0 stages (ms) | rank 1 / only rank stages (ms) | FPS | vs `taehv` (Wan encoder) |
+|---|---|---|---|---|---|
+| 1 GPU `taehv_full` | 186 | – | encode 7.4, DiT 168, decode 9.1, copy 1.5 | **21.4** | 14.1 |
+| 2 ranks `taehv_full` | 103 | encode 7.4, DiT 86, recv 8 | recv 0.8, DiT 89, decode 9.1, copy 1.3 | **38.9** | 21.1 |
+| 2 ranks + `--schedule_block` (split stays [0,15],[15,30]) | 99 | encode 7.4, DiT 87, recv 4 | DiT 87, decode 9.1, copy 1.5 | **40.1** | 26.5 |
+| 2 ranks + `--overlap_decode --schedule_block` | 96 | encode 7.4, DiT 87 | DiT 89, decode enqueue 4.9, copy 1.5 (async decode 9.9) | **41.4** | 27.0 |
+
+- With both VAE halves swapped the whole VAE costs ~18 ms per chunk (encode 7 + decode 9 + copy 1.5) and the
+  pipeline is DiT-bound: 2 × 87 ms of DiT per chunk over 2 ranks gives a ~90 ms floor, and the measured period is
+  96–103 ms. The scheduler sees both ranks within 4 ms (`t_total` 0.084 / 0.088 s) and correctly leaves the
+  15/15 split alone. Scaling 1 → 2 ranks is 1.82× (1.93× with the overlaps), i.e. the pipeline parallelism now
+  works as designed because nothing large is left outside the split.
+- Output: 237 frames from 243 (one latent of lag plus the last partial group), mean/std of the pixels comparable to
+  the Wan-encoder runs; TAEHV-encoder latents are within 5 % of Wan's, so the DiT sees a near-identical input.
+  Visual quality of the generated video was not scored (no reference exists for a generative output); the encoder
+  round trip is 31.6 dB vs Wan's 33.4 dB.
+- Real-time check: 4 frames per 96 ms = 41 FPS > 16 FPS input rate; the 1-GPU `taehv_full` run (21 FPS) is also
+  above real time, which neither `wan` (9.0) nor `taehv` (14.1) reached on one GPU.
+
+
 ## 7. Answer to the research question
 
 The TAEHV decoder is exactly as fast inside V2 as in isolation (9 ms per chunk on the final rank). It did not
@@ -347,9 +400,17 @@ The TAEHV decoder is exactly as fast inside V2 as in isolation (9 ms per chunk o
 whole on one rank each. Swapping the decoder removed the final rank's 168 ms tail, at which point rank 0's
 unsplittable Wan encoder (101 ms) plus its DiT blocks became the period, and the one-shot block scheduler then
 correctly rebalanced to within 3 ms of the optimum. Overlapping either VAE half with the DiT on the same GPU recovers
-only ~5 % because all three are GPU-bound, and it also blinds the scheduler. Measured best: 27.0 FPS on 2 A100s
-(`--vae taehv --overlap_decode --schedule_block`) versus 8.96 FPS on 1 GPU with the Wan decoder and 17.4 FPS on
-2 GPUs with it.
+only ~5 % because all three are GPU-bound, and it also blinds the scheduler. Swapping the encoder as well (Step 5)
+removes the last large unsplit stage: the VAE drops to ~18 ms per chunk, the pipeline becomes DiT-bound, and 2-rank
+scaling reaches 1.8–1.9×.
+
+| configuration (2 × A100, 480×832, `--step 2`) | FPS |
+|---|---|
+| 1 GPU, Wan VAE | 8.96 |
+| 2 ranks, Wan VAE, `--schedule_block` | 17.4 |
+| 2 ranks, Wan encoder + TAEHV decoder, `--overlap_decode --schedule_block` | 27.0 |
+| 1 GPU, TAEHV encoder + decoder | 21.4 |
+| 2 ranks, TAEHV encoder + decoder, `--overlap_decode --schedule_block` | **41.4** |
 
 ## 5. Files
 
@@ -357,10 +418,11 @@ only ~5 % because all three are GPU-bound, and it also blinds the scheduler. Mea
 |---|---|
 | New | `StreamDiffusionV2/examples/bench_taehv_decoder.py` |
 | New | `StreamDiffusionV2/examples/check_taehv_latent_space.py` (Step 2 latent-convention / contract check) |
-| Edit | `StreamDiffusionV2/causvid/models/wan/wan_wrapper.py` (add `TAEHVDecoderWrapper`), `causvid/models/__init__.py` (registry), `causvid/models/wan/causal_stream_inference.py` (reads `args.vae`) |
+| Edit | `StreamDiffusionV2/causvid/models/wan/wan_wrapper.py` (add `TAEHVDecoderWrapper`; Step 5: `TAEHVFullWrapper`), `causvid/models/__init__.py` (registry), `causvid/models/wan/causal_stream_inference.py` (reads `args.vae`) |
 | New | `StreamDiffusionV2/streamv2v/stage_timer.py` (Step 3: opt-in CUDA-event stage timer, `--timing_dir`) |
 | New | `StreamDiffusionV2/examples/make_looped_clip.py`, `examples/run_step3.sh`, `examples/summarize_step3.py` (Step 3: 3× clip, run matrix with recorded commands, summary tables) |
 | New | `StreamDiffusionV2/examples/run_step4.sh` (Step 4 variant matrix; `summarize_step3.py` reads Step 3 + Step 4 together) |
+| New | `StreamDiffusionV2/examples/check_taehv_encoder.py`, `examples/run_step5.sh` (Step 5: encoder check, `taehv_full` runs) |
 | Edit | `StreamDiffusionV2/streamv2v/inference.py`, `streamv2v/inference_pipe.py` (`--vae` flag; Step 3: `--timing_dir` marks in every rank loop, scheduler dump; Step 4: `--overlap_decode`, `--overlap_encode`, `AsyncDecodeSink`) |
 | Reuse | `/home/joshua/taehv/taehv.py` (`TAEHV`, `StreamingTAEHV`); `WanVAEWrapper.stream_decode_to_pixel` as baseline |
 | Untouched | `/home/joshua/StreamDiffusion.git` (v1) |
@@ -372,6 +434,8 @@ only ~5 % because all three are GPU-bound, and it also blinds the scheduler. Mea
 - Step 2 ✅ done: `--vae taehv` produces 81 frames like `--vae wan` on 1 and 2 ranks; TAEHV decode of a real Wan latent = 29.1 dB vs Wan decode (normalized latent as-is); `taehv_parallel` gives 24/81 frames.
 - Step 3 ✅ done: per-rank timing JSONL for all 18 runs; `wan` 2-rank FPS 15.0 reproduces Step 2 / README; 1 → 2 rank
   ratio per decoder reported; timer overhead nil (15.18 FPS timed vs untimed); repeats within 2.1 %.
+- Step 5 ✅ done: `--vae taehv_full` verified (latents within 5 % of Wan, 31.6 dB round trip, 7 ms per chunk),
+  pipeline runs on 1 and 2 ranks, 237/243 frames, 41.4 FPS best.
 - Step 4 ✅ done: overlap decode / overlap encode measured against the Step 3 baselines, with and without
   `--schedule_block`; output frame count and pixel statistics unchanged; scheduler interaction documented.
 - Final write-up (section 7) answers the question with numbers: decode share of the final-rank stage, whether FPS
