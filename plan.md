@@ -223,6 +223,67 @@ single-GPU runs shared the host concurrently, so treat single-GPU numbers as ind
 
 This is the main step. H1 is answered here.
 
+**Step 3 result (2026-09-24, A100 80GB PCIe ×2, bf16, 480×832, `--step 2`, `examples/original_x3.mp4` = 243 frames / 60 chunks,
+each config run twice back-to-back on an idle host; repeats agree within 2.1 %):**
+
+Implemented: `streamv2v/stage_timer.py` (CUDA-event marks on the compute stream + `perf_counter`, one JSONL row per
+iteration per rank, off unless `--timing_dir` is given; a timed and an untimed run give the same 15.18 FPS),
+marks in all four loops of `inference_pipe.py` / `inference.py`, a scheduler dump in `_handle_block_scheduling`,
+`examples/run_step3.sh` (the exact 18 commands are in `outputs/step3/commands.txt`), `examples/summarize_step3.py`
+(`outputs/step3/summary.csv`, `stages.csv`). Stage intervals are the CUDA-event gaps on the default stream: they sum
+to the iteration, whereas host times mislead for async stages (encode launches in 9 ms, its kernels take 101 ms).
+
+Per-rank stage split, medians over ~50 steady-state iterations (ms, share of that rank's period):
+
+| config | rank | period | recv-wait | encode | DiT | decode | host copy | FPS |
+|---|---|---|---|---|---|---|---|---|
+| 1 GPU `wan` | 0 | 448 | – | 101 (23 %) | 172 (38 %) | 170 (38 %) | 5 | 8.96 |
+| 1 GPU `taehv` | 0 | 284 | – | 101 (36 %) | 172 (60 %) | 9 (3 %) | 2 | 14.12 |
+| 2 ranks `wan` | 0 | 263–269 | **73–79 (28 %)** | 100 (38 %) | 89 (34 %) | – | – | |
+| 2 ranks `wan` | 1 | 263–269 | 0.8 (0 %) | – | 88 (34 %) | **168 (64 %)** | 5–11 | 15.04 |
+| 2 ranks `taehv` | 0 | 191 | 0.8 (0 %) | **101 (53 %)** | 88 (46 %) | – | – | |
+| 2 ranks `taehv` | 1 | 191 | **84 (44 %)** | – | 87 (45 %) | 9 (5 %) | 11 | 21.08 |
+| 2 ranks `wan` + `--schedule_block` → [0,21],[21,30] | 0 | 230 | 4 (2 %) | 101 (44 %) | 123 (54 %) | – | – | |
+| 2 ranks `wan` + `--schedule_block` | 1 | 230 | 0.8 (0 %) | – | 55 (24 %) | 169 (74 %) | 5 | 17.38 |
+| 2 ranks `taehv` + `--schedule_block` → [0,7],[7,30] | 0 | 149 | 3 (2 %) | 101 (68 %) | 43 (29 %) | – | – | |
+| 2 ranks `taehv` + `--schedule_block` | 1 | 149 | 0.8 (0 %) | – | 133 (90 %) | 9 (6 %) | 5 | 26.52 |
+| 2 ranks `taehv_parallel` (H3) | 1 | 191 | 92 (48 %) | – | 87 | 9 (5 %) | 3 | 5.28 (1 frame/iter) |
+
+FPS scaling, mean of the two repeats (frames actually produced / wall time):
+
+| decoder | 1 GPU | 2 ranks | ratio | 2 ranks + schedule | ratio |
+|---|---|---|---|---|---|
+| `wan` | 8.96 | 15.04 | 1.68× | 17.38 | 1.94× |
+| `taehv` | 14.12 | 21.08 | 1.49× | 26.52 | 1.88× |
+| `taehv_parallel` | 3.52 | 5.28 | 1.50× | 6.81 | 1.93× |
+
+- **H1 confirmed, and the missing 68 ms is attributed.** With `wan`, decode + copy is 64 % of the final rank's
+  iteration, the final rank never waits (recv 0.8 ms), and rank 0 idles 73–79 ms per chunk waiting for it: decode
+  is the pipeline period. With `taehv`, decode + copy drops to 10 % and the final rank now idles 84 ms (44 %) per
+  chunk in recv-wait; rank 0's own work, **Wan encoder 101 ms + DiT blocks 0–14 88 ms = 191 ms**, is the period.
+  The 263 → 191 ms change equals rank 0's former wait (73 ms), i.e. the fast decoder removed the whole final-rank
+  tail and exposed the next station. Nothing else in the loop is slow: send/send-wait are < 1 ms, host copy 2–11 ms.
+- **The decoder is not "bad at parallelism"; it is not split, and neither is the encoder.** Both VAE halves land
+  whole on one rank. Once decode is cheap, the Wan *encoder* (101 ms, unchanged in every run) is the largest
+  unsplittable stage and sets a floor on the period no matter how many ranks are added: 4 frames / (101 ms + rank 0's
+  blocks) ≈ 40 FPS at best with 2+ ranks, unless the encoder is also swapped or overlapped.
+- **H2 refuted as stated.** The one-shot, minimum-based scheduler sees encode and decode correctly
+  (`t_total_list` = [0.181, 0.249] s with `wan`, [0.182, 0.101] s with `taehv`) and moves blocks the right way:
+  6 blocks *to* rank 0 with `wan` (→ 230 ms period, both ranks within 3 ms of each other), 8 blocks *to* rank 1 with
+  `taehv` (→ 149 ms, both ranks within 1 ms). The balanced period equals (encode + all DiT + decode + copy) / 2 to
+  within 3 ms in both cases, so there is nothing left for a mean-based or repeated rebalance to recover on 2 ranks.
+  The scheduler's only cost is the one-shot stall (0.3–0.8 s) at iteration 9–10.
+- **H3 numbers:** `taehv_parallel` costs the same 9.2 ms per call as streaming TAEHV but yields 1 frame per
+  iteration (64 of 241 frames), so real throughput is 3.5 / 5.3 / 6.8 FPS; the scripts' logged 14.1 FPS on 1 GPU is
+  `chunk_size / t` and fictitious.
+- Single-GPU anchor: the DiT alone is 172 ms per chunk (both halves of the 2-rank split sum to 176 ms), so
+  `taehv` on 1 GPU is encode-and-DiT-bound at 284 ms; the 1 → 2 rank ratio is 1.49× because the encoder cannot move.
+- Artifacts: `outputs/step3/<cfg>/{timing_rank*.jsonl, schedule_rank*.json, log.txt, output_000.mp4, gpu_before.txt}`,
+  `outputs/step3/{summary.csv, stages.csv, commands.txt, run.log}`; smoke checks in `outputs/step3_smoke/`.
+- Consequence for Step 4: fix (a)/(c) (overlap decode, pinned copy) can at most recover the 9 + 5 ms decode + copy on
+  the `taehv` scheduled split; the lever is now the encoder (TAEHV encoder on rank 0, or overlap encode of chunk k+1
+  with DiT of chunk k on a side stream), and the block scheduler already does its job.
+
 ### Step 4 — Attribute and validate fixes (diagram page 2, green notes)
 Only after Step 3 points at a cause, test the matching fix to confirm the attribution:
 
@@ -238,6 +299,58 @@ Only after Step 3 points at a cause, test the matching fix to confirm the attrib
 
 Report each fix as "final-rank stage ms before/after, pipeline FPS before/after, 1-rank vs 2-rank".
 
+**Step 4 result (2026-09-24, same setup as Step 3, one repeat per variant, baselines = Step 3 runs):**
+
+Implemented in `streamv2v/inference_pipe.py`, both opt-in:
+- `--overlap_decode` = fixes (a)+(c): `AsyncDecodeSink` runs `stream_decode_to_pixel` on a side CUDA stream and copies the
+  pixels into a ring of pinned host buffers with a non-blocking copy; the loop only harvests finished decodes. The
+  end-of-iteration sync becomes compute-stream-only so the side stream keeps running into the next receive + DiT.
+- `--overlap_encode`: rank 0 encodes chunk k+1 (`_encode_chunk`: Wan `stream_encode` + SDEdit blend) on a side stream
+  right before launching the DiT of chunk k, and consumes it next iteration via an event wait.
+- Output check on the 20-chunk clip: 81 frames, mean |pixel diff| to a baseline run 9.9/255 vs 11.8/255 between two
+  baseline runs (the SDEdit noise is random per run), no NaN. Commands in `outputs/step4/commands.txt`.
+
+| decoder | variant | 2 ranks FPS (period ms) | + `--schedule_block` FPS (period, split) | rank-1 DiT ms on compute stream |
+|---|---|---|---|---|
+| `wan` | base (Step 3) | 15.04 (266) | 17.38 (231, [0,21]) | 88 |
+| `wan` | overlap decode | 15.84 (252) | **13.43** (298, [0,7]) | **232** |
+| `wan` | overlap encode | 15.09 (266) | 16.74 (238, [0,20]) | 88 |
+| `wan` | both | 15.65 (255) | 14.10 (284, [0,10]) | 236 |
+| `taehv` | base (Step 3) | 21.08 (191) | 26.52 (149, [0,7]) | 132 (rank 0 DiT 43 + encode 101) |
+| `taehv` | overlap decode | 21.06 (192) | **27.04** (147, [0,6]) | 139 |
+| `taehv` | overlap encode | 22.17 (184) | 25.80 (156, [0,10]) | rank 0 DiT 182 (encode hidden inside) |
+| `taehv` | both | 22.12 (181) | 25.92 (154, [0,10]) | rank 0 DiT 153 |
+
+- **Fix (a)+(c) validated as attribution, not as a speed-up.** Taking decode off the compute stream removes it from
+  rank 1's stage list (decode+copy 173 → 18 ms on the compute stream) but the GPU is still doing it: rank 1's DiT
+  stretches from 88 to 232 ms while the 168 ms Wan decode runs beside it (async decode measured at 174 ms). Net gain
+  with `wan` is 263 → 252 ms per chunk (+5 % FPS): both stages are GPU-bound and the A100 has no spare capacity to
+  overlap them. With `taehv` the decode is 9 ms and rank 0 is the period, so the fix changes nothing (21.06 vs 21.08);
+  with scheduling it buys the last 2 % (26.5 → 27.0 FPS, the best configuration measured).
+- **Encode overlap, same story.** Rank 0's DiT grows from 88 to 182 ms when the 101 ms encode runs beside it; the
+  station shortens only from 191 to 184 ms (+5 % FPS with `taehv`). The Wan encoder saturates the GPU exactly as
+  the Wan decoder does.
+- **Both overlaps break the block scheduler (H2 addendum).** It measures rank time with `torch.cuda.synchronize()`
+  around the compute path, so side-stream decode is invisible (`t_total` rank 1 = 0.094 s with `wan` + overlap decode:
+  it moves 8 blocks *onto* the still-busy rank 1 and FPS falls 17.4 → 13.4) and side-stream encode is folded into
+  `t_dit` (rank 0 `t_dit` 0.174 s, inflating `dit_time_per_block`, so it moves only 5 blocks and leaves rank 1 waiting
+  29 ms; 26.5 → 25.8 FPS). Any overlap fix must give the scheduler the real per-rank iteration period, not stage sums.
+- **Ceiling reached with this encoder.** The balanced 2-rank period is (encode 101 + DiT 176 + decode/copy 6) / 2
+  ≈ 142 ms → 28 FPS; `taehv` + overlap decode + scheduling measures 147 ms / 27.0 FPS. The only remaining levers are
+  ones this plan did not scope: replace the encoder as well (TAEHV encoder, 1.47 M params, untested for quality
+  through the DiT), give encode or decode its own rank (fix (b), needs a 3rd GPU), or shrink the DiT.
+
+## 7. Answer to the research question
+
+The TAEHV decoder is exactly as fast inside V2 as in isolation (9 ms per chunk on the final rank). It did not
+"underperform in parallelism": the pipeline parallelism splits only the 30 DiT blocks, while both VAE halves sit
+whole on one rank each. Swapping the decoder removed the final rank's 168 ms tail, at which point rank 0's
+unsplittable Wan encoder (101 ms) plus its DiT blocks became the period, and the one-shot block scheduler then
+correctly rebalanced to within 3 ms of the optimum. Overlapping either VAE half with the DiT on the same GPU recovers
+only ~5 % because all three are GPU-bound, and it also blinds the scheduler. Measured best: 27.0 FPS on 2 A100s
+(`--vae taehv --overlap_decode --schedule_block`) versus 8.96 FPS on 1 GPU with the Wan decoder and 17.4 FPS on
+2 GPUs with it.
+
 ## 5. Files
 
 | Action | Path |
@@ -245,7 +358,10 @@ Report each fix as "final-rank stage ms before/after, pipeline FPS before/after,
 | New | `StreamDiffusionV2/examples/bench_taehv_decoder.py` |
 | New | `StreamDiffusionV2/examples/check_taehv_latent_space.py` (Step 2 latent-convention / contract check) |
 | Edit | `StreamDiffusionV2/causvid/models/wan/wan_wrapper.py` (add `TAEHVDecoderWrapper`), `causvid/models/__init__.py` (registry), `causvid/models/wan/causal_stream_inference.py` (reads `args.vae`) |
-| Edit | `StreamDiffusionV2/streamv2v/inference.py`, `streamv2v/inference_pipe.py` (`--vae` flag, event timings) |
+| New | `StreamDiffusionV2/streamv2v/stage_timer.py` (Step 3: opt-in CUDA-event stage timer, `--timing_dir`) |
+| New | `StreamDiffusionV2/examples/make_looped_clip.py`, `examples/run_step3.sh`, `examples/summarize_step3.py` (Step 3: 3× clip, run matrix with recorded commands, summary tables) |
+| New | `StreamDiffusionV2/examples/run_step4.sh` (Step 4 variant matrix; `summarize_step3.py` reads Step 3 + Step 4 together) |
+| Edit | `StreamDiffusionV2/streamv2v/inference.py`, `streamv2v/inference_pipe.py` (`--vae` flag; Step 3: `--timing_dir` marks in every rank loop, scheduler dump; Step 4: `--overlap_decode`, `--overlap_encode`, `AsyncDecodeSink`) |
 | Reuse | `/home/joshua/taehv/taehv.py` (`TAEHV`, `StreamingTAEHV`); `WanVAEWrapper.stream_decode_to_pixel` as baseline |
 | Untouched | `/home/joshua/StreamDiffusion.git` (v1) |
 
@@ -254,8 +370,10 @@ Report each fix as "final-rank stage ms before/after, pipeline FPS before/after,
 - Step 1 ✅ done: streaming == full-clip Mode A (exact); chunked Mode A differs; T=1 streaming decode = 8.7 ms
   (tripwire value), Wan = 165 ms.
 - Step 2 ✅ done: `--vae taehv` produces 81 frames like `--vae wan` on 1 and 2 ranks; TAEHV decode of a real Wan latent = 29.1 dB vs Wan decode (normalized latent as-is); `taehv_parallel` gives 24/81 frames.
-- Step 3: per-rank timing JSON exists for every configuration; a summary table reproduces the README-style
-  FPS for `--vae wan` as a sanity anchor; the 1-rank vs 2-rank FPS ratio is reported per decoder.
-- Final write-up answers the question with numbers: decode share of the final-rank stage, whether FPS
+- Step 3 ✅ done: per-rank timing JSONL for all 18 runs; `wan` 2-rank FPS 15.0 reproduces Step 2 / README; 1 → 2 rank
+  ratio per decoder reported; timer overhead nil (15.18 FPS timed vs untimed); repeats within 2.1 %.
+- Step 4 ✅ done: overlap decode / overlap encode measured against the Step 3 baselines, with and without
+  `--schedule_block`; output frame count and pixel statistics unchanged; scheduler interaction documented.
+- Final write-up (section 7) answers the question with numbers: decode share of the final-rank stage, whether FPS
   scales with ranks for each decoder, whether the scheduler's block split changes when decode cost is
   weighted correctly, and the measured effect of each validated fix.

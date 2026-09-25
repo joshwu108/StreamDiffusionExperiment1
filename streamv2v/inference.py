@@ -11,6 +11,7 @@ inference pipeline on a single GPU:
 from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
+from streamv2v.stage_timer import StageTimer
 from omegaconf import OmegaConf
 import argparse
 import torch
@@ -104,6 +105,10 @@ class SingleGPUInferencePipeline:
         # Initialize pipeline
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+
+        # Opt-in per-iteration stage timing (plan.md Step 3); no-op unless --timing_dir is given
+        timing_dir = config.get('timing_dir', None)
+        self.timer = StageTimer(0, timing_dir, enabled=timing_dir is not None)
         
         # Performance tracking
         self.t_dit = 100.0
@@ -227,6 +232,7 @@ class SingleGPUInferencePipeline:
         
         # Process remaining chunks
         while self.processed < num_chunks + num_steps - 1:
+            self.timer.mark('iter_start')
             # Update indices
             start_idx = end_idx
             end_idx = end_idx + chunk_size
@@ -250,6 +256,8 @@ class SingleGPUInferencePipeline:
                 noisy_latents = torch.randn(1,self.pipeline.num_frame_per_block,16,self.pipeline.height,self.pipeline.width, device=self.device, dtype=torch.bfloat16)
                 current_step = None # Use default steps
 
+            self.timer.mark('encode')
+
             # if current_start//self.pipeline.frame_seq_length >= self.t_refresh:
             #     current_start = self.pipeline.kv_cache_length - self.pipeline.frame_seq_length
             #     current_end = current_start + (chunk_size // 4) * self.pipeline.frame_seq_length
@@ -265,6 +273,8 @@ class SingleGPUInferencePipeline:
                 current_step=current_step,
             )
 
+            self.timer.mark('dit')
+
             if self.processed > self.processed_offset:
                 torch.cuda.synchronize()
                 dit_fps_list.append(chunk_size/(time.time()-dit_start_time))
@@ -276,12 +286,16 @@ class SingleGPUInferencePipeline:
                 video = self.pipeline.vae.stream_decode_to_pixel(denoised_pred[[-1]])
                 video = (video * 0.5 + 0.5).clamp(0, 1)
                 video = video[0].permute(0, 2, 3, 1).contiguous()
+                self.timer.mark('decode')
                 
                 results[save_results] = video.cpu().float().numpy()
+                self.timer.mark('host_copy')
                 save_results += 1
             
                 # Update timing
                 torch.cuda.synchronize()
+                self.timer.end_iter(iteration=self.processed, chunk_idx=int(start_idx), frames=int(video.shape[0]),
+                                    sched_ms=0.0, blocks=[0, self.pipeline.num_transformer_blocks])
                 end_time = time.time()
                 t = end_time - start_time
                 fps_test = chunk_size/t
@@ -296,6 +310,11 @@ class SingleGPUInferencePipeline:
                     self.logger.info(f"Adjust chunk size to {chunk_size}")
 
                 start_time = end_time
+            elif self.timer.enabled:
+                # warm-up iteration without decode: close the timing row (timer-only sync)
+                torch.cuda.synchronize()
+                self.timer.end_iter(iteration=self.processed, chunk_idx=int(start_idx), frames=0, sched_ms=0.0,
+                                    blocks=[0, self.pipeline.num_transformer_blocks])
         
         # Save final video
         video_list = [results[i] for i in range(num_chunks)]
@@ -308,6 +327,7 @@ class SingleGPUInferencePipeline:
         export_to_video(video, output_path, fps=fps)
         self.logger.info(f"Video saved to: {output_path}")
         
+        self.timer.dump()
         self.logger.info("Single GPU inference pipeline completed")
 
 
@@ -331,6 +351,8 @@ def main():
     parser.add_argument("--num_frames", type=int, default=81, help="Video length (number of frames)")
     parser.add_argument("--fixed_noise_scale", action="store_true", default=False)
     parser.add_argument("--target_fps", type=int, required=False, default=None, help="Video length (number of frames)")
+    parser.add_argument("--timing_dir", type=str, default=None,
+                        help="If set, write per-iteration stage timings (timing_rank0.jsonl) there")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)

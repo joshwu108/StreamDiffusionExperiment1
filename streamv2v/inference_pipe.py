@@ -9,6 +9,7 @@ from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipe
 from streamv2v.inference import compute_noise_scale_and_step
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
+from streamv2v.stage_timer import StageTimer
 from omegaconf import OmegaConf
 import argparse
 import torch
@@ -75,6 +76,57 @@ def load_mp4_as_tensor(
 
 
 
+class AsyncDecodeSink:
+    """
+    Step 4 fix (a)+(c): run the VAE decode on a side CUDA stream and copy the pixels into pinned host
+    memory with a non-blocking copy, so decode overlaps the final rank's next receive + DiT instead of
+    being a tail on its iteration. `submit` enqueues work and returns immediately; `harvest` moves every
+    finished decode into `results` (a numpy copy of the pinned buffer, so a small ring of buffers suffices).
+    """
+
+    def __init__(self, n_buffers: int = 4):
+        self.stream = torch.cuda.Stream()
+        self.free = []
+        self.inflight = []      # (done_event, pinned_buffer, key, n_frames, start_event)
+        self.n_buffers = n_buffers
+
+    def _buffer(self, shape):
+        for i, b in enumerate(self.free):
+            if tuple(b.shape) == tuple(shape):
+                return self.free.pop(i)
+        return torch.empty(tuple(shape), dtype=torch.float32, pin_memory=True)
+
+    def submit(self, vae, latent: torch.Tensor, key: int) -> int:
+        cur = torch.cuda.current_stream()
+        self.stream.wait_stream(cur)
+        latent.record_stream(self.stream)
+        with torch.cuda.stream(self.stream):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            video = vae.stream_decode_to_pixel(latent)
+            video = (video * 0.5 + 0.5).clamp(0, 1)
+            video = video[0].permute(0, 2, 3, 1).contiguous().float()
+            buf = self._buffer(video.shape)
+            buf.copy_(video, non_blocking=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e1.record()
+        self.inflight.append((e1, buf, key, int(video.shape[0]), e0))
+        return int(video.shape[0])
+
+    def harvest(self, results: dict, block: bool = False):
+        """Returns (number harvested, GPU ms of the last harvested decode+copy or None)."""
+        n, ms = 0, None
+        while self.inflight and (block or self.inflight[0][0].query()):
+            e1, buf, key, frames, e0 = self.inflight.pop(0)
+            e1.synchronize()
+            results[key] = buf.numpy().copy()
+            ms = e0.elapsed_time(e1)
+            if len(self.free) < self.n_buffers:
+                self.free.append(buf)
+            n += 1
+        return n, ms
+
+
 class InferencePipelineManager:
     """
     Manages the inference pipeline with communication abstractions.
@@ -100,6 +152,17 @@ class InferencePipelineManager:
 
         self.com_stream = torch.cuda.Stream()
         self.control_stream = torch.cuda.Stream()
+
+        # Opt-in per-iteration stage timing (plan.md Step 3); no-op unless --timing_dir is given
+        timing_dir = config.get('timing_dir', None)
+        self.timer = StageTimer(rank, timing_dir, enabled=timing_dir is not None)
+
+        # Step 4 fixes, both opt-in: decode on a side stream + pinned copy (final rank),
+        # encode of chunk k+1 overlapped with the DiT of chunk k (rank 0)
+        self.overlap_decode = bool(config.get('overlap_decode', False))
+        self.overlap_encode = bool(config.get('overlap_encode', False))
+        self.decode_sink = AsyncDecodeSink() if self.overlap_decode else None
+        self.enc_stream = torch.cuda.Stream() if self.overlap_encode else None
         
         # Setup logging
         self.logger = setup_logging(rank)
@@ -140,6 +203,25 @@ class InferencePipelineManager:
         
         self.logger.info(f"Initialized InferencePipelineManager for rank {rank}")
     
+    def _sync_iter(self):
+        """End-of-iteration sync: the whole device by default, only the compute stream when a
+        side stream is meant to keep running across iterations (Step 4 overlaps)."""
+        if self.overlap_decode or self.overlap_encode:
+            torch.cuda.current_stream().synchronize()
+        else:
+            torch.cuda.synchronize()
+
+    def _encode_chunk(self, input_video_original, start_idx, end_idx, chunk_size, noise_scale, init_noise_scale):
+        """Wan-encode frames [start_idx, end_idx) and SDEdit-blend them on the current stream."""
+        inp = input_video_original[:, :, start_idx:end_idx]
+        noise_scale, current_step = compute_noise_scale_and_step(
+            input_video_original, end_idx, chunk_size, noise_scale, init_noise_scale
+        )
+        latents = self.pipeline.vae.stream_encode(inp)
+        latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
+        noise = torch.randn_like(latents)
+        return noise * noise_scale + latents * (1 - noise_scale), noise_scale, current_step
+
     def load_model(self, checkpoint_folder: str):
         """Load the model from checkpoint."""
         state_dict = torch.load(os.path.join(checkpoint_folder, "model.pt"), map_location="cpu")["generator"]
@@ -183,11 +265,14 @@ class InferencePipelineManager:
         init_noise_scale = noise_scale
         
         outstanding = []
+        pending = None   # (noisy_latents, noise_scale, current_step, event) encoded ahead on enc_stream
         
         torch.cuda.synchronize()
         start_time = time.time()
         
         while True:
+            self.timer.mark('iter_start')
+            sched_ms = 0.0
             # Process new chunk if available
             start_idx = end_idx
             end_idx = end_idx + chunk_size
@@ -200,16 +285,17 @@ class InferencePipelineManager:
                 
             if end_idx <= input_video_original.shape[2]:
                 inp = input_video_original[:, :, start_idx:end_idx]
-                
-                noise_scale, current_step = compute_noise_scale_and_step(
-                    input_video_original, end_idx, chunk_size, noise_scale, init_noise_scale
-                )
-                
-                latents = self.pipeline.vae.stream_encode(inp)
-                latents = latents.transpose(2, 1).contiguous().to(dtype=torch.bfloat16)
-                
-                noise = torch.randn_like(latents)
-                noisy_latents = noise * noise_scale + latents * (1 - noise_scale)
+                if pending is not None:
+                    # this chunk was encoded on enc_stream during the previous iteration's DiT
+                    noisy_latents, noise_scale, current_step, enc_event = pending
+                    pending = None
+                    torch.cuda.current_stream().wait_event(enc_event)
+                    noisy_latents.record_stream(torch.cuda.current_stream())
+                else:
+                    noisy_latents, noise_scale, current_step = self._encode_chunk(
+                        input_video_original, start_idx, end_idx, chunk_size, noise_scale, init_noise_scale)
+
+            self.timer.mark('encode')
 
             # if current_start//self.pipeline.frame_seq_length >= self.t_refresh:
             #     current_start = self.pipeline.kv_cache_length - self.pipeline.frame_seq_length
@@ -221,6 +307,16 @@ class InferencePipelineManager:
                 start_dit = time.time()
                 t_vae = start_dit - start_vae
             
+            # Step 4 fix: encode the next chunk on a side stream while the DiT runs this one
+            if self.overlap_encode and end_idx + chunk_size <= input_video_original.shape[2]:
+                with torch.cuda.stream(self.enc_stream):
+                    self.enc_stream.wait_stream(torch.cuda.current_stream())
+                    nl, ns, cs = self._encode_chunk(
+                        input_video_original, end_idx, end_idx + chunk_size, chunk_size, noise_scale, init_noise_scale)
+                    enc_event = torch.cuda.Event()
+                    enc_event.record(self.enc_stream)
+                pending = (nl, ns, cs, enc_event)
+
             # Run inference
             denoised_pred, patched_x_shape = self.pipeline.inference(
                 noise=noisy_latents,
@@ -231,6 +327,8 @@ class InferencePipelineManager:
                 block_num=block_num[self.rank],
             )
             
+            self.timer.mark('dit')
+
             # Update DiT timing
             if schedule_block:
                 torch.cuda.synchronize()
@@ -257,12 +355,14 @@ class InferencePipelineManager:
                     latent_data = self.data_transfer.receive_latent_data_async(num_steps)
             
             torch.cuda.current_stream().wait_stream(self.com_stream)
+            self.timer.mark('recv')
             
             # Wait for outstanding operations
             while len(outstanding) >= self.config.get('max_outstanding', 1):
                 oldest = outstanding.pop(0)
                 for work in oldest:
                     work.wait()
+            self.timer.mark('send_wait')
             
             # Send data to next rank
             with torch.cuda.stream(self.com_stream):
@@ -276,13 +376,19 @@ class InferencePipelineManager:
                     current_step=current_step
                 )
                 outstanding.append(work_objects)
+            self.timer.mark('send')
+            with torch.cuda.stream(self.com_stream):
                 # Handle block scheduling
                 if schedule_block and self.processed >= self.schedule_step:
+                    _t_sched = time.perf_counter()
                     self._handle_block_scheduling(block_num, total_blocks)
+                    sched_ms = (time.perf_counter() - _t_sched) * 1e3
                     schedule_block = False
 
             # Update timing and check completion
-            torch.cuda.synchronize()
+            self._sync_iter()
+            self.timer.end_iter(iteration=self.processed, chunk_idx=int(start_idx), frames=0, sched_ms=sched_ms,
+                                blocks=block_num[self.rank].tolist())
             end_time = time.time()
             t = end_time - start_time
             self.logger.info(f"Encode {self.processed}, time: {t:.4f} s, fps: {inp.shape[2]/t:.4f}")
@@ -302,6 +408,7 @@ class InferencePipelineManager:
             if self.processed + self.processed_offset >= num_chunks + num_steps * self.world_size + self.world_size - self.rank - 1:
                 break
         
+        self.timer.dump()
         self.logger.info("Rank 0 inference loop completed")
     
     def run_final_rank_loop(self, num_chunks: int, num_steps: int, chunk_size: int,
@@ -325,6 +432,8 @@ class InferencePipelineManager:
         start_time = time.time()
         
         while save_results < num_chunks:
+            self.timer.mark('iter_start')
+            sched_ms = 0.0
             # Receive data from previous rank
             with torch.cuda.stream(self.com_stream):
                 if 'latent_data' in locals():
@@ -341,9 +450,12 @@ class InferencePipelineManager:
                 latent_data = self.data_transfer.receive_latent_data_async(num_steps)
                 # Handle block scheduling
                 if schedule_block and self.processed >= self.schedule_step - self.rank:
+                    _t_sched = time.perf_counter()
                     self._handle_block_scheduling(block_num, total_blocks)
+                    sched_ms = (time.perf_counter() - _t_sched) * 1e3
                     schedule_block = False
             torch.cuda.current_stream().wait_stream(self.com_stream)
+            self.timer.mark('recv')
             
             # Measure DiT time if scheduling is enabled
             if schedule_block:
@@ -362,6 +474,8 @@ class InferencePipelineManager:
                 block_x=latent_data.latents,
             )
             
+            self.timer.mark('dit')
+
             # Update DiT timing
             if schedule_block:
                 torch.cuda.synchronize()
@@ -376,6 +490,7 @@ class InferencePipelineManager:
                 oldest = outstanding.pop(0)
                 for work in oldest:
                     work.wait()
+            self.timer.mark('send_wait')
             
             # Send data to next rank (if not the last rank)
             with torch.cuda.stream(self.com_stream):
@@ -389,6 +504,7 @@ class InferencePipelineManager:
                     current_step=latent_data.current_step
                 )
                 outstanding.append(work_objects)
+            self.timer.mark('send')
 
             # Decode and save video
             if self.processed >= num_steps * self.world_size - 1:
@@ -396,16 +512,28 @@ class InferencePipelineManager:
                     torch.cuda.synchronize()
                     start_vae = time.time()
 
-                video = self.pipeline.vae.stream_decode_to_pixel(denoised_pred[[-1]])
-                video = (video * 0.5 + 0.5).clamp(0, 1)
-                video = video[0].permute(0, 2, 3, 1).contiguous()
+                if self.overlap_decode:
+                    # Step 4 fix (a)+(c): enqueue decode + pinned copy on the side stream, harvest what finished
+                    n_frames = self.decode_sink.submit(self.pipeline.vae, denoised_pred[[-1]], save_results)
+                    self.timer.mark('decode')
+                    _, decode_async_ms = self.decode_sink.harvest(results)
+                    self.timer.mark('host_copy')
+                else:
+                    video = self.pipeline.vae.stream_decode_to_pixel(denoised_pred[[-1]])
+                    video = (video * 0.5 + 0.5).clamp(0, 1)
+                    video = video[0].permute(0, 2, 3, 1).contiguous()
+                    self.timer.mark('decode')
+                    
+                    results[save_results] = video.cpu().float().numpy()
+                    self.timer.mark('host_copy')
+                    n_frames, decode_async_ms = int(video.shape[0]), None
                 
-                results[save_results] = video.cpu().float().numpy()
-                
-                torch.cuda.synchronize()
+                self._sync_iter()
+                self.timer.end_iter(iteration=self.processed, chunk_idx=int(latent_data.chunk_idx), frames=n_frames,
+                                    sched_ms=sched_ms, blocks=block_num[self.rank].tolist(), decode_async_ms=decode_async_ms)
                 end_time = time.time()
                 t = end_time - start_time
-                fps_test = video.shape[0]/t
+                fps_test = n_frames/t
                 if self.processed > self.schedule_step:
                     fps_list.append(fps_test)
                 self.logger.info(f"Decode {self.processed}, time: {t:.4f} s, FPS: {fps_test:.4f}")
@@ -418,10 +546,18 @@ class InferencePipelineManager:
                 
                 save_results += 1
                 start_time = end_time
+            elif self.timer.enabled:
+                # warm-up iteration without decode: close the timing row (timer-only sync)
+                self._sync_iter()
+                self.timer.end_iter(iteration=self.processed, chunk_idx=int(latent_data.chunk_idx), frames=0,
+                                    sched_ms=sched_ms, blocks=block_num[self.rank].tolist())
                 
             if save_results >= num_chunks:
                 break
         
+        if self.overlap_decode:
+            self.decode_sink.harvest(results, block=True)
+
         # Save final video
         video_list = [results[i] for i in range(num_chunks)]
         video = np.concatenate(video_list, axis=0)
@@ -433,6 +569,7 @@ class InferencePipelineManager:
         output_path = os.path.join(output_folder, f"output_{0:03d}.mp4")
         export_to_video(video, output_path, fps=fps)
         self.logger.info(f"Video saved to: {output_path} (Press Ctrl+C to force exit)")
+        self.timer.dump()
     
     def run_middle_rank_loop(self, num_chunks: int, num_steps: int, chunk_size: int,
                             block_num: torch.Tensor, schedule_block: bool, total_blocks: int):
@@ -451,6 +588,8 @@ class InferencePipelineManager:
         fps_list = []
         
         while True:
+            self.timer.mark('iter_start')
+            sched_ms = 0.0
             # Receive data from previous rank
             with torch.cuda.stream(self.com_stream):
                 if 'latent_data' in locals():
@@ -466,10 +605,13 @@ class InferencePipelineManager:
 
                 # Handle block scheduling
                 if schedule_block and self.processed >= self.schedule_step - self.rank:
+                    _t_sched = time.perf_counter()
                     self._handle_block_scheduling(block_num, total_blocks)
+                    sched_ms = (time.perf_counter() - _t_sched) * 1e3
                     schedule_block = False
 
             torch.cuda.current_stream().wait_stream(self.com_stream)
+            self.timer.mark('recv')
 
             if schedule_block:
                 torch.cuda.synchronize()
@@ -487,6 +629,8 @@ class InferencePipelineManager:
                 block_x=latent_data.latents,
             )
             
+            self.timer.mark('dit')
+
             if schedule_block:
                 torch.cuda.synchronize()
                 temp = time.time() - start_dit
@@ -500,6 +644,7 @@ class InferencePipelineManager:
                 oldest = outstanding.pop(0)
                 for work in oldest:
                     work.wait()
+            self.timer.mark('send_wait')
             
             # Send data to next rank
             with torch.cuda.stream(self.com_stream):
@@ -513,9 +658,12 @@ class InferencePipelineManager:
                     current_step=latent_data.current_step
                 )
                 outstanding.append(work_objects)
+            self.timer.mark('send')
             
             # Update timing
             torch.cuda.synchronize()
+            self.timer.end_iter(iteration=self.processed, chunk_idx=int(latent_data.chunk_idx), frames=0, sched_ms=sched_ms,
+                                blocks=block_num[self.rank].tolist())
             end_time = time.time()
             t = end_time - start_time
 
@@ -535,11 +683,14 @@ class InferencePipelineManager:
                 break
         
         self.logger.info(f"DiT Average FPS: {np.mean(fps_list):.4f}")
+        self.timer.dump()
         self.logger.info(f"Rank {self.rank} inference loop completed")
     
     def _handle_block_scheduling(self, block_num: torch.Tensor, total_blocks: int):
         """Handle block scheduling and rebalancing."""
         self.logger.info(f"Scheduling block in {self.processed}")
+        _t0 = time.perf_counter()
+        block_before = block_num.tolist()
         
         # Gather timing information from all ranks
         t_total_tensor = torch.tensor(self.t_total, dtype=torch.float32, device=self.device)
@@ -578,10 +729,16 @@ class InferencePipelineManager:
                 self.pipeline.kv_cache1[i]['k'] = self.pipeline.kv_cache1[i]['k'].cpu()
                 self.pipeline.kv_cache1[i]['v'] = self.pipeline.kv_cache1[i]['v'].cpu()
 
+        self.logger.info(f"Block split before: {block_before} after: {block_num.tolist()} | "
+                         f"t_dit_list: {t_dit_list} t_total_list: {t_list}")
+        self.timer.note('schedule', processed=self.processed, block_before=block_before, block_after=block_num.tolist(),
+                        t_dit_list=t_dit_list, t_total_list=t_list, my_t_dit=self.t_dit, my_t_total=self.t_total,
+                        wall_ms=(time.perf_counter() - _t0) * 1e3)
         self.logger.info("Block scheduling completed")
     
     def cleanup(self):
         """Clean up resources."""
+        self.timer.dump()
         self.data_transfer.cleanup()
         self.logger.info("InferencePipelineManager cleanup completed")
 
@@ -609,6 +766,12 @@ def main():
     parser.add_argument("--vae", type=str, default="wan", choices=["wan", "taehv", "taehv_parallel"],
                         help="Decoder: wan = Wan 2.1 VAE stream_decode (default); taehv = StreamingTAEHV, state kept "
                              "across chunks; taehv_parallel = TAEHV.decode_video(parallel=True) per chunk (H3 misuse)")
+    parser.add_argument("--timing_dir", type=str, default=None,
+                        help="If set, write per-iteration stage timings (timing_rank{r}.jsonl) and scheduler dumps there")
+    parser.add_argument("--overlap_decode", action="store_true", default=False,
+                        help="Step 4 fix (a)+(c): final rank decodes on a side CUDA stream with a pinned, non-blocking host copy")
+    parser.add_argument("--overlap_encode", action="store_true", default=False,
+                        help="Step 4 fix: rank 0 encodes chunk k+1 on a side CUDA stream while the DiT runs chunk k")
     
     args = parser.parse_args()
     
